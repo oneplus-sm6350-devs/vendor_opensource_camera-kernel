@@ -39,6 +39,9 @@
 #define CAM_ISP_GENERIC_BLOB_TYPE_MAX               \
 	(CAM_ISP_GENERIC_BLOB_TYPE_CSID_QCFA_CONFIG + 1)
 
+static int cam_ife_hw_mgr_handle_hw_dump_bus_info(
+	void *ctx, void *evt_info);
+
 static uint32_t blob_type_hw_cmd_map[CAM_ISP_GENERIC_BLOB_TYPE_MAX] = {
 	CAM_ISP_HW_CMD_GET_HFR_UPDATE,
 	CAM_ISP_HW_CMD_CLOCK_UPDATE,
@@ -1335,10 +1338,6 @@ static int cam_convert_hw_idx_to_ife_hw_num(int hw_idx)
 				return CAM_ISP_IFE1_LITE_HW;
 			else if (hw_idx == 4)
 				return CAM_ISP_IFE2_LITE_HW;
-			else if (hw_idx == 5)
-				return CAM_ISP_IFE3_LITE_HW;
-			else if (hw_idx == 6)
-				return CAM_ISP_IFE4_LITE_HW;
 			break;
 		case CAM_CPAS_TITAN_170_V200:
 			if (hw_idx == 0)
@@ -4214,6 +4213,11 @@ static int cam_ife_mgr_start_hw(void *hw_mgr_priv, void *start_hw_args)
 	bool                              res_rdi_context_set = false;
 	uint32_t                          primary_rdi_src_res;
 	uint32_t                          primary_rdi_out_res;
+//case 04712337, 2020.08.06, for 64M QCFA pic stuck
+	uint32_t                          last_rdi_res;
+
+	uint32_t     last_rdi_src_res = CAM_ISP_HW_VFE_IN_MAX;
+	uint32_t     last_rdi_out_res = CAM_ISP_IFE_OUT_RES_MAX;
 
 	primary_rdi_src_res = CAM_ISP_HW_VFE_IN_MAX;
 	primary_rdi_out_res = CAM_ISP_IFE_OUT_RES_MAX;
@@ -4318,6 +4322,29 @@ start_only:
 
 	CAM_DBG(CAM_ISP, "START IFE OUT ... in ctx id:%d",
 		ctx->ctx_index);
+
+//case 04712337, 2020.08.06, for 64M QCFA pic stuck
+	/* Find out last rdi out resource */
+	for (i = 0; i < CAM_IFE_HW_OUT_RES_MAX; i++) {
+		hw_mgr_res = &ctx->res_list_ife_out[i];
+		switch (hw_mgr_res->res_id) {
+		case CAM_ISP_IFE_OUT_RES_RDI_0:
+		case CAM_ISP_IFE_OUT_RES_RDI_1:
+		case CAM_ISP_IFE_OUT_RES_RDI_2:
+		case CAM_ISP_IFE_OUT_RES_RDI_3:
+			if (ctx->is_rdi_only_context) {
+				last_rdi_res = i;
+				last_rdi_out_res = hw_mgr_res->res_id;
+			}
+		default:
+			break;
+		}
+	}
+	if (ctx->is_rdi_only_context) {
+		hw_mgr_res = &ctx->res_list_ife_out[last_rdi_res];
+		hw_mgr_res->hw_res[0]->rdi_only_last_res = true;
+	}
+
 	/* start the IFE out devices */
 	for (i = 0; i < CAM_IFE_HW_OUT_RES_MAX; i++) {
 		hw_mgr_res = &ctx->res_list_ife_out[i];
@@ -4348,6 +4375,10 @@ start_only:
 	if (primary_rdi_out_res < CAM_ISP_IFE_OUT_RES_MAX)
 		primary_rdi_src_res =
 			cam_convert_rdi_out_res_id_to_src(primary_rdi_out_res);
+//case 04712337, 2020.08.06, for 64M QCFA pic stuck
+	if (last_rdi_out_res < CAM_ISP_IFE_OUT_RES_MAX)
+		last_rdi_src_res =
+			cam_convert_rdi_out_res_id_to_src(last_rdi_out_res);
 
 	CAM_DBG(CAM_ISP, "START IFE SRC ... in ctx id:%d",
 		ctx->ctx_index);
@@ -4356,6 +4387,10 @@ start_only:
 		if (primary_rdi_src_res == hw_mgr_res->res_id) {
 			hw_mgr_res->hw_res[0]->rdi_only_ctx =
 				ctx->is_rdi_only_context;
+		}
+//case 04712337, 2020.08.06, for 64M QCFA pic stuck
+		if (last_rdi_src_res == hw_mgr_res->res_id) {
+			hw_mgr_res->hw_res[0]->rdi_only_last_res = true;
 		}
 		rc = cam_ife_hw_mgr_start_hw_res(hw_mgr_res, ctx);
 		if (rc) {
@@ -6386,13 +6421,14 @@ static void cam_ife_mgr_print_io_bufs(struct cam_packet *packet,
 
 static int cam_ife_mgr_cmd(void *hw_mgr_priv, void *cmd_args)
 {
-	int rc = 0;
+	int i, rc = 0;
 	struct cam_hw_cmd_args *hw_cmd_args = cmd_args;
 	struct cam_ife_hw_mgr  *hw_mgr = hw_mgr_priv;
 	struct cam_ife_hw_mgr_ctx *ctx = (struct cam_ife_hw_mgr_ctx *)
 		hw_cmd_args->ctxt_to_hw_map;
-	struct cam_isp_hw_cmd_args *isp_hw_cmd_args = NULL;
-	struct cam_packet          *packet;
+	struct cam_isp_hw_cmd_args      *isp_hw_cmd_args = NULL;
+	struct cam_packet               *packet;
+	struct cam_isp_hw_event_info     event_info;
 	unsigned long rem_jiffies = 0;
 
 	if (!hw_mgr_priv || !cmd_args) {
@@ -6462,6 +6498,15 @@ static int cam_ife_mgr_cmd(void *hw_mgr_priv, void *cmd_args)
 			hw_mgr->mgr_common.img_iommu_hdl_secure,
 			hw_cmd_args->u.pf_args.buf_info,
 			hw_cmd_args->u.pf_args.mem_found);
+		event_info.err_type = CAM_ISP_HW_ERROR_BUSIF_OVERFLOW;
+		event_info.res_type = CAM_ISP_RESOURCE_VFE_OUT;
+		event_info.hw_idx = 0;
+		for (i = 0; i < CAM_IFE_HW_OUT_RES_MAX; i++) {
+			event_info.res_id =
+				CAM_ISP_IFE_OUT_RES_BASE + (i & 0xFF);
+			cam_ife_hw_mgr_handle_hw_dump_bus_info(ctx,
+				&event_info);
+		}
 		break;
 	case CAM_HW_MGR_CMD_REG_DUMP_ON_FLUSH:
 		if (ctx->last_dump_flush_req_id == ctx->applied_req_id)
@@ -7010,6 +7055,38 @@ static int cam_ife_hw_mgr_handle_csid_event(
 	return 0;
 }
 
+static int cam_ife_hw_mgr_handle_hw_dump_bus_info(
+	void                                 *ctx,
+	void                                 *evt_info)
+{
+	struct cam_ife_hw_mgr_ctx     *ife_hw_mgr_ctx =
+		(struct cam_ife_hw_mgr_ctx *)ctx;
+	struct cam_isp_hw_event_info  *event_info =
+		(struct cam_isp_hw_event_info *)evt_info;
+	struct cam_ife_hw_mgr_res     *hw_mgr_res = NULL;
+	struct cam_hw_intf            *hw_intf;
+	uint32_t i, out_port_id;
+	int rc = 0;
+
+	out_port_id = event_info->res_id & 0xFF;
+	hw_mgr_res =
+		&ife_hw_mgr_ctx->res_list_ife_out[out_port_id];
+	for (i = 0; i < CAM_ISP_HW_SPLIT_MAX; i++) {
+		if (!hw_mgr_res->hw_res[i])
+			continue;
+		hw_intf = hw_mgr_res->hw_res[i]->hw_intf;
+		if (hw_intf->hw_ops.process_cmd) {
+			rc = hw_intf->hw_ops.process_cmd(
+				hw_intf->hw_priv,
+				CAM_ISP_HW_CMD_DUMP_BUS_INFO,
+				(void *)event_info,
+				sizeof(struct cam_isp_hw_event_info));
+		}
+	}
+
+	return rc;
+}
+
 static int cam_ife_hw_mgr_handle_hw_dump_info(
 	void                                 *ctx,
 	void                                 *evt_info)
@@ -7022,7 +7099,6 @@ static int cam_ife_hw_mgr_handle_hw_dump_info(
 	struct cam_isp_resource_node  *rsrc_node = NULL;
 	struct cam_hw_intf            *hw_intf;
 	uint32_t i, out_port_id;
-	uint64_t dummy_args;
 	int rc = 0;
 
 	list_for_each_entry(hw_mgr_res,
@@ -7042,25 +7118,6 @@ static int cam_ife_hw_mgr_handle_hw_dump_info(
 					CAM_ISP_HW_CMD_CAMIF_DATA,
 					rsrc_node,
 					sizeof(struct cam_isp_resource_node));
-			}
-		}
-	}
-
-	list_for_each_entry(hw_mgr_res,
-		&ife_hw_mgr_ctx->res_list_ife_csid, list) {
-		for (i = 0; i < CAM_ISP_HW_SPLIT_MAX; i++) {
-			if (!hw_mgr_res->hw_res[i])
-				continue;
-			hw_intf = hw_mgr_res->hw_res[i]->hw_intf;
-			if (hw_intf->hw_ops.process_cmd) {
-				rc = hw_intf->hw_ops.process_cmd(
-					hw_intf->hw_priv,
-					CAM_ISP_HW_CMD_CSID_CLOCK_DUMP,
-					&dummy_args,
-					sizeof(uint64_t));
-				if (rc)
-					CAM_ERR(CAM_ISP,
-						"CSID Clock Dump failed");
 			}
 		}
 	}
@@ -7233,7 +7290,8 @@ static void cam_ife_mgr_ctx_irq_dump(struct cam_ife_hw_mgr_ctx *ctx)
 
 static int cam_ife_hw_mgr_check_irq_for_dual_vfe(
 	struct cam_ife_hw_mgr_ctx            *ife_hw_mgr_ctx,
-	uint32_t                              hw_event_type)
+	uint32_t                              hw_event_type,
+        bool                                  detect_mismatch)
 {
 	int32_t                               rc = -1;
 	uint32_t                             *event_cnt = NULL;
@@ -7269,23 +7327,19 @@ static int cam_ife_hw_mgr_check_irq_for_dual_vfe(
 		return rc;
 	}
 
-	if ((event_cnt[master_hw_idx] &&
-		((int)(event_cnt[master_hw_idx] - event_cnt[slave_hw_idx]) > 1
-		)) ||
+	if (detect_mismatch && ((event_cnt[master_hw_idx] &&
+		((int)(event_cnt[master_hw_idx] - event_cnt[slave_hw_idx]) > 1)) ||
 		(event_cnt[slave_hw_idx] &&
-		((int)(event_cnt[slave_hw_idx] - event_cnt[master_hw_idx]) > 1
-		))) {
+		((int)(event_cnt[slave_hw_idx] - event_cnt[master_hw_idx]) > 1)))) {
 
 		CAM_ERR_RATE_LIMIT(CAM_ISP,
 			"One of the VFE could not generate hw event %d master[%d] core_cnt %d slave[%d] core_cnt %d",
 			hw_event_type, master_hw_idx, event_cnt[master_hw_idx],
 			slave_hw_idx, event_cnt[slave_hw_idx]);
-
 		if (ife_hw_mgr_ctx->dual_ife_irq_mismatch_cnt > 10) {
 			rc = -1;
 			return rc;
 		}
-
 		if (event_cnt[master_hw_idx] >= 2) {
 			event_cnt[master_hw_idx]--;
 			ife_hw_mgr_ctx->dual_ife_irq_mismatch_cnt++;
@@ -7299,6 +7353,7 @@ static int cam_ife_hw_mgr_check_irq_for_dual_vfe(
 		if (ife_hw_mgr_ctx->dual_ife_irq_mismatch_cnt == 1)
 			cam_ife_mgr_ctx_irq_dump(ife_hw_mgr_ctx);
 		rc = 0;
+
 	}
 
 	CAM_DBG(CAM_ISP, "Only one core_index has given hw event %d",
@@ -7332,7 +7387,11 @@ static int cam_ife_hw_mgr_handle_hw_epoch(
 	case CAM_ISP_HW_VFE_IN_CAMIF:
 		ife_hw_mgr_ctx->epoch_cnt[event_info->hw_idx]++;
 		rc = cam_ife_hw_mgr_check_irq_for_dual_vfe(ife_hw_mgr_ctx,
-			CAM_ISP_HW_EVENT_EPOCH);
+			CAM_ISP_HW_EVENT_SOF, false);
+                if (rc)
+			break;
+		rc = cam_ife_hw_mgr_check_irq_for_dual_vfe(ife_hw_mgr_ctx,
+			CAM_ISP_HW_EVENT_EPOCH, true);
 		if (!rc) {
 			epoch_done_event_data.frame_id_meta =
 				event_info->th_reg_val;
@@ -7389,7 +7448,7 @@ static int cam_ife_hw_mgr_handle_hw_sof(
 	case CAM_ISP_HW_VFE_IN_RD:
 		ife_hw_mgr_ctx->sof_cnt[event_info->hw_idx]++;
 		rc = cam_ife_hw_mgr_check_irq_for_dual_vfe(ife_hw_mgr_ctx,
-			CAM_ISP_HW_EVENT_SOF);
+			CAM_ISP_HW_EVENT_SOF, true);
 		if (!rc) {
 			if (ife_hw_mgr_ctx->is_offline)
 				cam_ife_hw_mgr_get_offline_sof_timestamp(
@@ -7464,7 +7523,7 @@ static int cam_ife_hw_mgr_handle_hw_eof(
 	case CAM_ISP_HW_VFE_IN_CAMIF:
 		ife_hw_mgr_ctx->eof_cnt[event_info->hw_idx]++;
 		rc = cam_ife_hw_mgr_check_irq_for_dual_vfe(ife_hw_mgr_ctx,
-			CAM_ISP_HW_EVENT_EOF);
+			CAM_ISP_HW_EVENT_EOF, true);
 		if (!rc) {
 			ife_hw_irq_eof_cb(ife_hw_mgr_ctx->common.cb_priv,
 				CAM_ISP_HW_EVENT_EOF, &eof_done_event_data);
@@ -7736,6 +7795,8 @@ int cam_ife_hw_mgr_init(struct cam_hw_mgr_intf *hw_mgr_intf, int *iommu_hdl)
 	mutex_init(&g_ife_hw_mgr.ctx_mutex);
 	spin_lock_init(&g_ife_hw_mgr.ctx_lock);
 
+	spin_lock_init(&g_ife_hw_mgr.ctx_lock);
+
 	if (CAM_IFE_HW_NUM_MAX != CAM_IFE_CSID_HW_NUM_MAX) {
 		CAM_ERR(CAM_ISP, "CSID num is different then IFE num");
 		return -EINVAL;
@@ -7870,7 +7931,7 @@ int cam_ife_hw_mgr_init(struct cam_hw_mgr_intf *hw_mgr_intf, int *iommu_hdl)
 
 	/* Create Worker for ife_hw_mgr with 10 tasks */
 	rc = cam_req_mgr_workq_create("cam_ife_worker", 10,
-			&g_ife_hw_mgr.workq, CRM_WORKQ_USAGE_NON_IRQ, 0, false,
+			&g_ife_hw_mgr.workq, CRM_WORKQ_USAGE_NON_IRQ, 0,
 			cam_req_mgr_process_workq_cam_ife_worker);
 	if (rc < 0) {
 		CAM_ERR(CAM_ISP, "Unable to create worker");

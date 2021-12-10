@@ -298,6 +298,7 @@ struct cam_isp_context {
 	atomic_t                              rxd_epoch;
 	struct cam_req_mgr_core_workq        *workq;
 	int32_t                               trigger_id;
+	uint64_t                              last_sof_timestamp;
 };
 
 /**

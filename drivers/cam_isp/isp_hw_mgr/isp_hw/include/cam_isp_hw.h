@@ -112,7 +112,6 @@ enum cam_isp_hw_cmd_type {
 	CAM_ISP_HW_CMD_FE_TRIGGER_CMD,
 	CAM_ISP_HW_CMD_CSID_CHANGE_HALT_MODE,
 	CAM_ISP_HW_CMD_GET_IRQ_REGISTER_DUMP,
-	CAM_ISP_HW_CMD_CSID_CLOCK_DUMP,
 	CAM_ISP_HW_CMD_MAX,
 };
 
@@ -145,6 +144,7 @@ struct cam_isp_hw_cmd_query {
  *                                schedule IRQ events related to this resource
  * @irq_handle:                   handle returned on subscribing for IRQ event
  * @rdi_only_ctx:                 resource belong to rdi only context or not
+ * @rdi_only_last_res:            Last resource belong to rdi only context
  * @init:                         function pointer to init the HW resource
  * @deinit:                       function pointer to deinit the HW resource
  * @start:                        function pointer to start the HW resource
@@ -165,6 +165,8 @@ struct cam_isp_resource_node {
 	void                          *tasklet_info;
 	int                            irq_handle;
 	int                            rdi_only_ctx;
+//case 04712337, 2020.08.06, for 64M QCFA pic stuck
+	int                            rdi_only_last_res;
 
 	int (*init)(struct cam_isp_resource_node *rsrc_node,
 		void *init_args, uint32_t arg_size);
@@ -220,6 +222,7 @@ struct cam_isp_hw_cmd_buf_update {
  * @Brief:         Get cmd buffer for WM updates.
  *
  * @ image_buf:    image buffer address array
+ * @ image_buf_offset: image buffer address offset array
  * @ num_buf:      Number of buffers in the image_buf array
  * @ frame_header: frame header iova
  * @ local_id:     local id for the wm
@@ -228,6 +231,7 @@ struct cam_isp_hw_cmd_buf_update {
  */
 struct cam_isp_hw_get_wm_update {
 	dma_addr_t                     *image_buf;
+	uint32_t                        image_buf_offset[CAM_PACKET_MAX_PLANES];
 	uint32_t                        num_buf;
 	uint64_t                        frame_header;
 	uint32_t                        local_id;

@@ -1240,6 +1240,14 @@ static int __cam_isp_ctx_notify_sof_in_activated_state(
 			struct cam_ctx_request, list);
 		req_isp = (struct cam_isp_ctx_req *) req->req_priv;
 
+		if (ctx_isp->last_sof_timestamp ==
+			ctx_isp->sof_timestamp_val) {
+			CAM_DBG(CAM_ISP,
+				"Possible tasklet delay for bubble req: %lld, since frame_cnt = %lld",
+				req->request_id, ctx_isp->bubble_frame_cnt);
+			goto notify_only;
+		}
+
 		if (ctx_isp->bubble_frame_cnt >= 1 &&
 			req_isp->bubble_detected) {
 			req_isp->num_acked = 0;
@@ -1263,6 +1271,7 @@ static int __cam_isp_ctx_notify_sof_in_activated_state(
 				req->request_id);
 	}
 
+notify_only:
 	if (ctx->ctx_crm_intf && ctx->ctx_crm_intf->notify_trigger &&
 		ctx_isp->active_req_cnt <= 2) {
 		if (ctx_isp->subscribe_event & CAM_TRIGGER_POINT_SOF) {
@@ -1306,7 +1315,7 @@ static int __cam_isp_ctx_notify_sof_in_activated_state(
 			ctx->ctx_id);
 		rc = -EFAULT;
 	}
-
+	ctx_isp->last_sof_timestamp = ctx_isp->sof_timestamp_val;
 	return 0;
 }
 
@@ -1511,6 +1520,8 @@ static int __cam_isp_ctx_epoch_in_applied(struct cam_isp_context *ctx_isp,
 		&& !req_isp->bubble_report) {
 		request_id = req->request_id;
 		ctx_isp->reported_req_id = request_id;
+	} else {
+		CAM_INFO(CAM_ISP, "bubble_report:%d req->request_id:%lld", req->request_id, req_isp->bubble_report);
 	}
 	__cam_isp_ctx_send_sof_timestamp(ctx_isp, request_id,
 		CAM_REQ_MGR_SOF_EVENT_ERROR);
@@ -3456,6 +3467,66 @@ error:
 	return 0;
 }
 
+//case 04712337, 2020.08.06, for 64M QCFA pic stuck
+static int __cam_isp_ctx_rdi_only_reg_upd_in_applied_state(
+	struct cam_isp_context *ctx_isp, void *evt_data)
+{
+	struct cam_ctx_request  *req = NULL;
+	struct cam_context      *ctx = ctx_isp->base;
+	struct cam_isp_ctx_req  *req_isp;
+	uint64_t  request_id  = 0;
+
+	if (list_empty(&ctx->wait_req_list)) {
+		CAM_ERR(CAM_ISP, "Reg upd ack with no waiting request");
+		goto end;
+	}
+	ctx_isp->substate_activated = CAM_ISP_CTX_ACTIVATED_EPOCH;
+
+	req = list_first_entry(&ctx->wait_req_list,
+			struct cam_ctx_request, list);
+	list_del_init(&req->list);
+
+	req_isp = (struct cam_isp_ctx_req *) req->req_priv;
+
+	request_id = (req_isp->hw_update_data.packet_opcode_type ==
+			CAM_ISP_PACKET_INIT_DEV) ? 0 : req->request_id;
+
+	if (req_isp->num_fence_map_out != 0) {
+		list_add_tail(&req->list, &ctx->active_req_list);
+		ctx_isp->active_req_cnt++;
+		request_id = req->request_id;
+		CAM_DBG(CAM_REQ,
+			"move request %lld to active list(cnt = %d), ctx %u",
+			req->request_id, ctx_isp->active_req_cnt, ctx->ctx_id);
+		__cam_isp_ctx_update_event_record(ctx_isp,
+			CAM_ISP_CTX_EVENT_RUP, req);
+	} else {
+		/* no io config, so the request is completed. */
+		list_add_tail(&req->list, &ctx->free_req_list);
+		CAM_DBG(CAM_ISP,
+			"move active request %lld to free list(cnt = %d), ctx %u",
+			req->request_id, ctx_isp->active_req_cnt, ctx->ctx_id);
+	}
+
+	CAM_DBG(CAM_ISP, "next Substate[%s]",
+		__cam_isp_ctx_substate_val_to_type(
+		ctx_isp->substate_activated));
+
+	__cam_isp_ctx_update_event_record(ctx_isp,
+		CAM_ISP_CTX_EVENT_RUP, req);
+
+	return 0;
+end:
+	__cam_isp_ctx_update_event_record(ctx_isp,
+		CAM_ISP_CTX_EVENT_RUP, NULL);
+	/*
+	 * There is no request in the pending list, move the sub state machine
+	 * to SOF sub state
+	 */
+	ctx_isp->substate_activated = CAM_ISP_CTX_ACTIVATED_SOF;
+	return 0;
+}
+
 static struct cam_isp_ctx_irq_ops
 	cam_isp_ctx_rdi_only_activated_state_machine_irq
 			[CAM_ISP_CTX_ACTIVATED_MAX] = {
@@ -3475,7 +3546,8 @@ static struct cam_isp_ctx_irq_ops
 		.irq_ops = {
 			__cam_isp_ctx_handle_error,
 			__cam_isp_ctx_rdi_only_sof_in_applied_state,
-			NULL,
+//case 04712337, 2020.08.06, for 64M QCFA pic stuck
+			__cam_isp_ctx_rdi_only_reg_upd_in_applied_state,
 			NULL,
 			NULL,
 			__cam_isp_ctx_buf_done_in_applied,
@@ -4354,7 +4426,7 @@ static int __cam_isp_ctx_acquire_hw_v2(struct cam_context *ctx,
 		ctx_isp->offline_context = true;
 
 		rc = cam_req_mgr_workq_create("offline_ife", 20,
-			&ctx_isp->workq, CRM_WORKQ_USAGE_IRQ, 0, false,
+			&ctx_isp->workq, CRM_WORKQ_USAGE_IRQ, 0,
 			cam_req_mgr_process_workq_offline_ife_worker);
 		if (rc)
 			CAM_ERR(CAM_ISP,
